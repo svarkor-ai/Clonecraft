@@ -1091,7 +1091,7 @@ g.ClonecraftCore = API;
     requestAnimationFrame(loop);
     var dt = Math.min((now - prevTime) / 1000, 0.05);
     prevTime = now;
-    if (!started && !paused) update(dt);   // round2b: ingen sim innan start; F5-paus stannar simuleringen (rendering fortsätter)
+    if (started && !paused) update(dt);    // MC 2339.19: simuleringen kör EFTER "Starta spelet" (var inverterad: kördes bara FÖRE start, så WASD/hopp gjorde inget när man väl spelade); F5-paus stannar simuleringen (rendering fortsätter)
     render();
 
     frames++;
@@ -1285,7 +1285,7 @@ g.ClonecraftCore = API;
       // round 2b — start: startBtn is the single entry point
       var startVisibleBefore = !intro.classList.contains("hide");
       startBtn.click();
-      out.input.startBtnStarts = started && !intro.classList.contains("hide");
+      out.input.startBtnStarts = started && intro.classList.contains("hide");   // MC 2339.19: after start the intro IS hidden (assertion was inverted)
       out.input.startVisibleBefore = startVisibleBefore;
 
       // round2c: hotbar selection — click a slot, then a key; both must

@@ -1,0 +1,15 @@
+{
+  "_comment": [
+    "vm106 hosting config -- STRICT JSON (no yaml lib). Committed at the repo root (MC 2339.19, P3g).",
+    "Static single-file site: index.html is the whole app (canvas 2D, no assets, no network).",
+    "Schema owner: infra/vm106/repo-visibility-hosting/reconcile.py (do not fork).",
+    "title/description/tags/icon feed the portfolio auto-index (hosted-index.json); cosmetic only, never a gate."
+  ],
+  "name": "clonecraft",
+  "type": "static",
+  "root": "apps/clonecraft",
+  "title": "Clonecraft",
+  "description": "Minecraft-liknande voxelvärld i en enda HTML-fil (canvas 2D) -- utforska, bryt och bygg med tangentbord, mus eller touch. ?selftest skriver ett JSON-bevis för värld, fysik, render och paus.",
+  "tags": ["static", "canvas", "voxel", "game", "single-file"],
+  "icon": "⛏"
+}
