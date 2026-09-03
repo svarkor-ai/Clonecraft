@@ -50,7 +50,15 @@
   .crosshair::before { left:50%; top:0; width:2px; height:100%; transform:translateX(-50%); }
   .crosshair::after  { top:50%; left:0; height:2px; width:100%; transform:translateY(-50%); }
   #topinfo { position:absolute; top:10px; left:12px; font-size:12px; color:rgba(255,255,255,.9);
-    text-shadow:0 1px 3px rgba(0,0,0,.8); font-variant-numeric:tabular-nums; }
+    text-shadow:0 1px 3px rgba(0,0,0,.8); font-variant-numeric:tabular-nums; display:flex;
+    align-items:center; gap:8px; }
+  /* T3-hp: health/hunger HUD bars */
+  #topinfo .bars { display:inline-flex; gap:4px; margin-left:6px; }
+  #topinfo .bar { width:72px; height:9px; border:1px solid rgba(255,255,255,.35);
+    border-radius:5px; background:rgba(0,0,0,.45); overflow:hidden; display:inline-block; }
+  #topinfo .bar-fill { display:block; height:100%; width:100%; transition:width .2s; }
+  #topinfo .bar-fill.health { background:linear-gradient(#ff6a6a,#c62828); }
+  #topinfo .bar-fill.hunger { background:linear-gradient(#ffd96a,#e8a020); }
   #msg { position:absolute; bottom:96px; left:50%; transform:translateX(-50%);
     background:rgba(0,0,0,.55); padding:8px 16px; border-radius:8px; font-size:14px;
     opacity:0; transition:opacity .2s; white-space:nowrap; }
@@ -126,7 +134,12 @@
 
 <div id="hud">
   <div class="crosshair" aria-hidden="true"></div>
-  <div id="topinfo"><span id="fps">– fps</span> · <span id="coords">0,0,0</span></div>
+  <div id="topinfo"><span id="fps">– fps</span> · <span id="coords">0,0,0</span>
+    <span class="bars" aria-hidden="true">
+      <span class="bar"><span class="bar-fill health" id="healthbar"></span></span>
+      <span class="bar"><span class="bar-fill hunger" id="hungerbar"></span></span>
+    </span>
+  </div>
   <div id="msg" role="status" aria-live="polite"></div>
   <div id="hotbar" role="toolbar" aria-label="Blockval"></div>
 </div>
@@ -285,6 +298,8 @@ function Player(world, x, y, z) {
   this.x = x; this.y = y; this.z = z; // feet-center position
   this.vx = 0; this.vy = 0; this.vz = 0;
   this.onGround = false;
+  this.health = 20;   // T3-hp: health 0..20
+  this.hunger = 20;   // T3-hp: hunger 0..20
 }
 
 Player.prototype.move = function (dx, dy, dz) {
@@ -306,254 +321,10 @@ Player.prototype.move = function (dx, dy, dz) {
   }
 };
 
-Player.prototype.step = function (dt) {
-  this.vy -= GRAVITY * dt;
-  if (this.vy < -48) this.vy = -48;
-  this.move(this.vx * dt, 0, this.vz * dt);
-  var dy = this.vy * dt;
-  this.onGround = false;
-  this.move(0, dy, 0);
-};
-
-/* ---------------- voxel raycast (DDA) ---------------- */
-function raycast(world, ox, oy, oz, dx, dy, dz, maxDist) {
-  maxDist = maxDist || 6;
-  var bx = Math.floor(ox), by = Math.floor(oy), bz = Math.floor(oz);
-  var stepX = dx > 0 ? 1 : -1, stepY = dy > 0 ? 1 : -1, stepZ = dz > 0 ? 1 : -1;
-  var tDX = dx !== 0 ? Math.abs(1 / dx) : Infinity;
-  var tDY = dy !== 0 ? Math.abs(1 / dy) : Infinity;
-  var tDZ = dz !== 0 ? Math.abs(1 / dz) : Infinity;
-  var tX = dx !== 0 ? (dx > 0 ? (bx + 1 - ox) * tDX : (ox - bx) * tDX) : Infinity;
-  var tY = dy !== 0 ? (dy > 0 ? (by + 1 - oy) * tDY : (oy - by) * tDY) : Infinity;
-  var tZ = dz !== 0 ? (dz > 0 ? (bz + 1 - oz) * tDZ : (oz - bz) * tDZ) : Infinity;
-  var faceX = 0, faceY = 0, faceZ = 0;
-  var t = 0;
-  for (var i = 0; i < 128; i++) {
-    if (tX < tY && tX < tZ) { bx += stepX; t = tX; tX += tDX; faceX = -stepX; faceY = 0; faceZ = 0; }
-    else if (tY < tZ) { by += stepY; t = tY; tY += tDY; faceX = 0; faceY = -stepY; faceZ = 0; }
-    else { bz += stepZ; t = tZ; tZ += tDZ; faceX = 0; faceY = 0; faceZ = -stepZ; }
-    if (t > maxDist) break;
-    var id = world.get(bx, by, bz);
-    if (id !== BLK.AIR && id !== BLK.WATER && id !== BLK.LAVA) {
-      return { block: [bx, by, bz], face: [faceX, faceY, faceZ], place: [bx + faceX, by + faceY, bz + faceZ] };
-    }
-  }
-  return null;
-}
-
-/* ---------------- module export (for node tests) ---------------- */
-/* ---------------- sound engine (round2b referenced C.Sound; round2c ships it) ----------------
-   Pure & headless-safe: no AudioContext is created until resume() is called in a browser.
-   play() is a no-op while muted (default) or without an AudioContext. */
-function Sound() {
-  this.muted = true;
-  this.ctx = null;
-}
-Sound.prototype.setMuted = function (v) { this.muted = !!v; };
-Sound.prototype.toggleMuted = function () { this.muted = !this.muted; };
-Sound.prototype.resume = function () {
-  if (this.ctx) return true;
-  var AC = (typeof AudioContext !== "undefined") ? AudioContext : (typeof webkitAudioContext !== "undefined" ? webkitAudioContext : null);
-  if (!AC) return false;
-  this.ctx = new AC();
-  if (this.ctx.state === "suspended") this.ctx.resume();
-  return true;
-};
-Sound.prototype.play = function (name) {
-  if (this.muted || !this.ctx || this.ctx.state !== "running") return;
-  var t = this.ctx.currentTime;
-  var osc = this.ctx.createOscillator();
-  var gain = this.ctx.createGain();
-  var f = { break: 180, place: 320, jump: 520 }[name] || 260;
-  osc.type = "square";
-  osc.frequency.setValueAtTime(f, t);
-  osc.frequency.exponentialRampToValueAtTime(Math.max(60, f * 0.6), t + 0.08);
-  gain.gain.setValueAtTime(0.06, t);
-  gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.09);
-  osc.connect(gain); gain.connect(this.ctx.destination);
-  osc.start(t); osc.stop(t + 0.1);
-};
-
-var API = {
-  BLK: BLK, createRng: createRng, makeNoise: makeNoise, World: World,
-  collides: collides, Player: Player, raycast: raycast,
-  PLAYER: PLAYER, GRAVITY: GRAVITY, JUMP_V: JUMP_V, WALK: WALK, SPRINT: SPRINT,
-  Sound: Sound
-};
-if (typeof module !== "undefined" && module.exports) { module.exports = API; }
-var g = (typeof window !== "undefined") ? window : globalThis;
-g.ClonecraftCore = API;
-
-
-
-
-
-/* ===== Clonecraft Core (pure, headless-importable) ===== */
-"use strict";
-/* ----------------------------------------------------------------
-   Clonecraft — core game logic (merged 699.6).
-   PURE & headless-importable (no DOM, no `window`): the unit tests
-   and the final HTML both embed this. Same shape as 699.5 but the
-   world/block set is extended for "djup":
-     + SNOW (8)  : snötäcke på hög höjd
-     + LAVA (9)  : lava under berggrunden (djup)
-   Enkodning: 1 Gräs, 2 Jord, 3 Sten, 4 Trä, 5 Löv, 6 Sand, 7 Vatten,
-             8 Snö, 9 Lava.
-   ---------------------------------------------------------------- */
-
-/* ---------------- block ids ---------------- */
-var BLK = { AIR: 0, GRASS: 1, DIRT: 2, STONE: 3, WOOD: 4, LEAVES: 5, SAND: 6, WATER: 7, SNOW: 8, LAVA: 9 };
-
-/* ---------------- deterministic PRNG (mulberry32) ---------------- */
-function createRng(seed) {
-  var a = seed >>> 0;
-  return function () {
-    a |= 0; a = (a + 0x6d2b79f5) | 0;
-    var t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-/* ---------------- value noise (bilinear, 2D) ---------------- */
-function makeNoise(seed) {
-  var rng = createRng(seed);
-  var g = new Array(256 * 256);
-  for (var i = 0; i < 256 * 256; i++) g[i] = rng();
-  function hash(ix, iy) { return g[((iy & 255) * 256 + (ix & 255))]; }
-  function smooth(t) { return t * t * (3 - 2 * t); }
-  function at(x, y) {
-    var x0 = Math.floor(x), y0 = Math.floor(y);
-    var fx = smooth(x - x0), fy = smooth(y - y0);
-    var a = hash(x0, y0), b = hash(x0 + 1, y0);
-    var c = hash(x0, y0 + 1), d = hash(x0 + 1, y0 + 1);
-    var t = a + (b - a) * fx;
-    var u = c + (d - c) * fx;
-    return t + (u - t) * fy;
-  }
-  return function (x, y, scale) {
-    return at(x * scale, y * scale);
-  };
-}
-
-/* ---------------- world ---------------- */
-function World(cx, cy, cz, seed) {
-  this.w = cx; this.h = cy; this.d = cz;
-  this.seed = seed;
-  this.data = new Uint8Array(cx * cy * cz);
-  this._generate();
-}
-
-World.prototype._idx = function (x, y, z) {
-  return (y * this.d + z) * this.w + x;
-};
-
-World.prototype.get = function (x, y, z) {
-  if (x < 0 || y < 0 || z < 0 || x >= this.w || y >= this.h || z >= this.d) return 0;
-  return this.data[this._idx(x, y, z)];
-};
-
-World.prototype.set = function (x, y, z, v) {
-  if (x < 0 || y < 0 || z < 0 || x >= this.w || y >= this.h || z >= this.d) return;
-  this.data[this._idx(x, y, z)] = v;
-};
-
-World.prototype._generate = function () {
-  var w = this.w, h = this.h, d = this.d;
-  var n = makeNoise(this.seed);
-  var n2 = makeNoise(this.seed + 1013);
-  var rng = createRng(this.seed * 7919 + 1);
-  var SEA = Math.floor(h * 0.42);
-  var BASE = Math.floor(h * 0.5);
-  var SNOWLINE = Math.floor(h * 0.62);   // djup: höga områden blir snö
-
-  for (var x = 0; x < w; x++) {
-    for (var z = 0; z < d; z++) {
-      // two-octave continental height + fine detail
-      var e = n(x, z, 0.05) * 0.6 + n(x, z, 0.15) * 0.4;
-      var hill = n2(x, z, 0.03) * 0.5 + n2(x, z, 0.09) * 0.5;
-      var height = Math.floor(BASE + (e - 0.5) * 16 + (hill - 0.5) * 12);
-
-      var LAVA_TOP = Math.floor(h * 0.22); // djup: lava under berggrunden
-      for (var y = 0; y < h; y++) {
-        var idx = this._idx(x, y, z);
-        if (y === 0) { this.data[idx] = BLK.STONE; continue; }
-        if (y < height) {
-          if (y <= LAVA_TOP) {
-            // lava "sjöar" under jorden, med sten runt — bara ojämnt spridda
-            this.data[idx] = (rng() < 0.22 && y > LAVA_TOP - 2) ? BLK.LAVA : BLK.STONE;
-          } else {
-            this.data[idx] = (height - y < 3) ? BLK.DIRT : BLK.STONE;
-          }
-        } else if (y === height) {
-          if (height < SEA) this.data[idx] = BLK.SAND;
-          else if (height >= SNOWLINE) this.data[idx] = BLK.SNOW;      // djup: snötäckt topp
-          else this.data[idx] = BLK.GRASS;
-        } else if (y <= SEA && height < SEA) {
-          this.data[idx] = BLK.WATER;
-        } else {
-          this.data[idx] = BLK.AIR;
-        }
-      }
-
-      // trees on grass above sea (not on snow)
-      if (this.get(x, height, z) === BLK.GRASS && height > SEA + 1 && height < SNOWLINE - 2 && rng() < 0.02) {
-        var th = height + 4 + Math.floor(rng() * 2);
-        for (var ty = height + 1; ty <= th; ty++) this.set(x, ty, z, BLK.WOOD);
-        for (var lx = x - 1; lx <= x + 1; lx++)
-          for (var lz = z - 1; lz <= z + 1; lz++)
-            for (var ly = th - 1; ly <= th + 1; ly++) {
-              if (this.get(lx, ly, lz) === BLK.AIR) this.set(lx, ly, lz, BLK.LEAVES);
-            }
-        this.set(x, th + 1, z, BLK.LEAVES);
-        this.set(x, th + 2, z, BLK.LEAVES);
-      }
-    }
-  }
-};
-
-/* ---------------- physics / collision (AABB vs voxel grid) ---------------- */
-var PLAYER = { W: 0.3, H: 0.9 }; // half-width, half-height (full 0.6 x 1.8 x 0.6)
-var GRAVITY = 24;
-var JUMP_V = 8.2;
-var WALK = 4.7;
-var SPRINT = 7.2;   // kjell "djup": spring
-
-function collides(world, px, py, pz) {
-  var x0 = Math.floor(px - PLAYER.W), x1 = Math.floor(px + PLAYER.W);
-  var y0 = Math.floor(py), y1 = Math.floor(py + PLAYER.H * 2);
-  var z0 = Math.floor(pz - PLAYER.W), z1 = Math.floor(pz + PLAYER.W);
-  for (var x = x0; x <= x1; x++)
-    for (var y = y0; y <= y1; y++)
-      for (var z = z0; z <= z1; z++)
-        if (world.get(x, y, z) !== BLK.AIR && world.get(x, y, z) !== BLK.WATER) return true;
-  return false;
-}
-
-function Player(world, x, y, z) {
-  this.world = world;
-  this.x = x; this.y = y; this.z = z; // feet-center position
-  this.vx = 0; this.vy = 0; this.vz = 0;
-  this.onGround = false;
-}
-
-Player.prototype.move = function (dx, dy, dz) {
-  if (dx !== 0) {
-    this.x += dx;
-    if (collides(this.world, this.x, this.y, this.z)) { this.x -= dx; this.vx = 0; }
-  }
-  if (dz !== 0) {
-    this.z += dz;
-    if (collides(this.world, this.x, this.y, this.z)) { this.z -= dz; this.vz = 0; }
-  }
-  if (dy !== 0) {
-    this.y += dy;
-    if (collides(this.world, this.x, this.y, this.z)) {
-      this.y -= dy;
-      if (dy < 0) this.onGround = true;
-      this.vy = 0;
-    } else if (dy < 0) { this.onGround = false; }
-  }
+Player.prototype.damage = function (n) {
+  // T3-hp: take damage, clamped to [0,20]; returns the new health.
+  this.health = Math.max(0, this.health - (n || 0));
+  return this.health;
 };
 
 Player.prototype.step = function (dt) {
@@ -662,7 +433,38 @@ g.ClonecraftCore = API;
     { n: [0,0,1] }, { n: [0,0,-1] }
   ];
 
-  function buildQuads(world, cam, px, py, pz, reach) {
+  /* T2-sky: sky gradient stops as a function of timeOfDay in [0,1) (0=midnight dawn,
+     ~0.25=sunrise, 0.5=noon, ~0.75=sunset). Returns [[offset,color], ...] for use with
+     createLinearGradient.addColorStop. Colour-mixes a day palette toward a night palette
+     by a smooth daylight factor driven by the sun's height above the horizon. */
+  function mixC(c1, c2, t) {
+    return [
+      Math.round(c1[0] + (c2[0] - c1[0]) * t),
+      Math.round(c1[1] + (c2[1] - c1[1]) * t),
+      Math.round(c1[2] + (c2[2] - c1[2]) * t)
+    ];
+  }
+  function skyGradient(timeOfDay) {
+    var sunAngle = (timeOfDay - 0.25) * Math.PI * 2;  // 0 at 0.25 (sunrise), pi/2 at 0.5 (noon)
+    var height = Math.sin(sunAngle);                  // 1 at noon, -1 at midnight
+    var day = Math.max(0, Math.min(1, (height + 0.4) / 0.9));
+    var dayTop = [121, 182, 242], nightTop = [9, 11, 36];      // "#79b6f2" day, deep navy night
+    var dayBot = [207, 231, 251], nightBot = [16, 20, 56];     // "#cfe7fb" day, dark blue night
+    var top = mixC(nightTop, dayTop, day);
+    var bot = mixC(nightBot, dayBot, day);
+    return [[0, "rgb(" + top[0] + "," + top[1] + "," + top[2] + ")"],
+            [1, "rgb(" + bot[0] + "," + bot[1] + "," + bot[2] + ")"]];
+  }
+  /* T2-sky: dynamic shade — the world-light multiplier as a function of timeOfDay.
+     Replaces the previous fixed "1" so block faces darken at night. Clamped so the world
+     is never pitch black. */
+  function skyLight(timeOfDay) {
+    var sunAngle = (timeOfDay - 0.25) * Math.PI * 2;
+    var height = Math.sin(sunAngle);
+    return Math.max(0.35, Math.min(1, (height + 0.45) / 0.95));
+  }
+
+  function buildQuads(world, cam, px, py, pz, reach, shadeMul) {
     var quads = [];
     var ox = Math.floor(px), oy = Math.floor(py), oz = Math.floor(pz);
     var r = Math.max(1, reach);
@@ -675,15 +477,19 @@ g.ClonecraftCore = API;
             var n = FACE_DIRS[f].n;
             var nb = world.get(x + n[0], y + n[1], z + n[2]);
             if (nb !== 0 && nb !== C.BLK.WATER && nb !== C.BLK.LAVA) continue;
-            quads.push(makeQuad(x, y, z, n, id));
+            quads.push(makeQuad(x, y, z, n, id, shadeMul));
           }
         }
     return quads;
   }
 
-  function makeQuad(x, y, z, n, id) {
+  function makeQuad(x, y, z, n, id, shadeMul) {
     var cx = x + 0.5, cy = y + 0.5, cz = z + 0.5;
-    var shade = FACE_SHADE[n[0] ? 'x' : (n[1] ? 'y' : 'z')];
+    // T2-sky: shade is the per-axis face constant scaled by the dynamic world-light
+    // multiplier (shadeMul is skyLight(timeOfDay), a function of the day/night clock).
+    var m = (shadeMul == null) ? 1 : shadeMul;
+    var shade = m * FACE_SHADE[n[0] ? 'x' : (n[1] ? 'y' : 'z')];
+    var axis = n[1] === 1 ? "top" : (n[1] === -1 ? "bottom" : "side");
     var pts;
     if (n[0]) {
       var vx = x + (n[0] > 0 ? 1 : 0);
@@ -695,7 +501,7 @@ g.ClonecraftCore = API;
       var vz = z + (n[2] > 0 ? 1 : 0);
       pts = [x, y, vz,   x+1, y, vz,   x+1, y+1, vz,   x, y+1, vz];
     }
-    return { cx: cx, cy: cy, cz: cz, n: n, pts: pts, color: id, shade: shade };
+    return { cx: cx, cy: cy, cz: cz, n: n, pts: pts, color: id, axis: axis, shade: shade };
   }
 
   function projectQuad(q, cam, f, w, h) {
@@ -722,7 +528,7 @@ g.ClonecraftCore = API;
     return dx*dx + dy*dy + dz*dz;
   }
 
-  function buildWater(world, cam, px, py, pz, reach) {
+  function buildWater(world, cam, px, py, pz, reach, shadeMul) {
     // top-face quads for water/lava whose top is exposed to air
     var out = [];
     var ox = Math.floor(px), oy = Math.floor(py), oz = Math.floor(pz);
@@ -732,7 +538,7 @@ g.ClonecraftCore = API;
         for (var z = oz - r; z <= oz + r; z++) {
           var id = world.get(x, y, z);
           if (id !== C.BLK.WATER && id !== C.BLK.LAVA) continue;
-          if (world.get(x, y + 1, z) === 0) out.push(makeQuad(x, y, z, [0, 1, 0], id));
+          if (world.get(x, y + 1, z) === 0) out.push(makeQuad(x, y, z, [0, 1, 0], id, shadeMul));
         }
     return out;
   }
@@ -740,7 +546,8 @@ g.ClonecraftCore = API;
   var API = {
     Camera: Camera, buildQuads: buildQuads, buildWater: buildWater,
     makeQuad: makeQuad, projectQuad: projectQuad, quadDistance: quadDistance,
-    FACE_SHADE: FACE_SHADE
+    FACE_SHADE: FACE_SHADE,
+    skyGradient: skyGradient, skyLight: skyLight
   };
   if (typeof module !== "undefined" && module.exports) { module.exports = API; }
   global.ClonecraftApp = API;
@@ -761,6 +568,8 @@ g.ClonecraftCore = API;
   var hud = document.getElementById("hud");
   var coordsEl = document.getElementById("coords");
   var fpsEl = document.getElementById("fps");
+  var healthEl = document.getElementById("healthbar");   // T3-hp
+  var hungerEl = document.getElementById("hungerbar");   // T3-hp
   var msgEl = document.getElementById("msg");
   var hotbarEl = document.getElementById("hotbar");
 
@@ -792,6 +601,76 @@ g.ClonecraftCore = API;
   var REACH = 6;
   var cam = new A.Camera(Math.PI, 0);
   cam.pos = [player.x, player.y + 1.55, player.z];
+
+  /* ---------- day/night clock (T2-sky) ----------
+     timeOfDay in [0,1): 0=midnight just past dawn, 0.25=sunrise, 0.5=noon, 0.75=sunset.
+     Full cycle = 20 minutes of real time (TIME_CYCLE seconds). The phase offset is derived
+     from the world SEED so the same seed always starts at the same sky (deterministic),
+     and the clock only advances inside update(), which the loop already gates on
+     `started && !paused` — so F5-pause freezes the sky too. */
+  var TIME_CYCLE = 20 * 60;               // 20 min in seconds
+  var timeOfDay = (SEED % 400) / 400;     // seed-deterministic initial sky phase
+
+  /* ---------- T4-save: localStorage save/load (ARCHITECTURE §3 T4-save) ----------
+     Serializes the full 96x48x96 grid (world.data, a Uint8Array -> base64 compacted)
+     + player pos/rot/health/hunger + timeOfDay. saveGame()/loadGame() read/write the
+     grid via functional world.get/set. Load is EXPLICIT-ONLY on a user-supplied seed
+     hash (#<digits>), so the default boot and ?selftest stay deterministic — a fresh
+     regeneration from seed remains the fallback, and any mismatched seed save is
+     ignored (same-seed guard). Best-effort: storage-full/private-mode failures simply
+     skip saving. */
+  var SAVE_KEY = "clonecraft.save.v1";
+  var lastSaveT = 0;                    // throttled periodic save (every SAVE_INTERVAL s)
+
+  function saveGame() {
+    try {
+      var arr = world.data, i, bin = "";
+      for (i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
+      localStorage.setItem(SAVE_KEY, JSON.stringify({
+        v: 1, seed: SEED, grid: btoa(bin),
+        player: { x: player.x, y: player.y, z: player.z,
+                  yaw: cam.yaw, pitch: cam.pitch,
+                  health: player.health, hunger: player.hunger },
+        timeOfDay: timeOfDay
+      }));
+      return true;
+    } catch (e) { return false; }   // quota / private mode — save is best-effort
+  }
+
+  function loadGame() {
+    var raw;
+    try { raw = localStorage.getItem(SAVE_KEY); } catch (e) { return false; }
+    if (!raw) return false;
+    try {
+      var s = JSON.parse(raw);
+      if (!s || s.v !== 1 || s.seed !== SEED) return false;   // same-seed only
+      var bin = atob(s.grid);
+      if (!bin || bin.length !== world.data.length) return false;
+      var w = world.w, d = world.d;
+      for (var i = 0; i < bin.length; i++) {
+        var x = i % w;
+        var zz = Math.floor(i / w) % d;
+        var yy = Math.floor(i / (w * d));
+        world.set(x, yy, zz, bin.charCodeAt(i));
+      }
+      if (s.player && typeof s.player.x === "number") {
+        player.x = s.player.x; player.y = s.player.y; player.z = s.player.z;
+        player.health = (typeof s.player.health === "number") ? s.player.health : 20;
+        player.hunger = (typeof s.player.hunger === "number") ? s.player.hunger : 20;
+        if (typeof s.player.yaw === "number") cam.yaw = s.player.yaw;
+        if (typeof s.player.pitch === "number") cam.pitch = s.player.pitch;
+        cam.pos = [player.x, player.y + 1.55, player.z];
+      }
+      if (typeof s.timeOfDay === "number") timeOfDay = s.timeOfDay;
+      showMsg("Laddade sparad värld");
+      return true;
+    } catch (e) { return false; }
+  }
+
+  // Load-override on boot, explicit-only when the user supplied a seed hash
+  // (deterministic fallback otherwise). The old default regenerates from seed.
+  var hasUserSeed = /^\#\d+$/.test(location.hash);
+  if (hasUserSeed) loadGame();
 
   /* ---------- pause (F5) ----------
      (round 2b: F5 är den enda pausvägen; Esc stänger; klickpå panelen togen bort) */
@@ -862,6 +741,20 @@ g.ClonecraftCore = API;
       5:"#3f7c2f", 6:"#e7d9a0", 7:"#3f7dd6", 8:"#eef4ff", 9:"#e05a20"
     }[id] || "#000";
   }
+  /* per-face base colour lookup (T1-tex): block -> {top, side, bottom}.
+     Grass top is a clear green, grass side a muted olive (distinct from
+     top AND from dirt side/bottom brown) — gives the classic column look. */
+  var FACE_MAP = {
+    1: { top: "#5fae44", side: "#7a8f3d", bottom: "#8a5a33" },
+    2: { top: "#8a5a33", side: "#8a5a33", bottom: "#8a5a33" },
+    3: { top: "#8b8b8b", side: "#8b8b8b", bottom: "#8b8b8b" },
+    4: { top: "#6b4a2b", side: "#6b4a2b", bottom: "#6b4a2b" },
+    5: { top: "#3f7c2f", side: "#3f7c2f", bottom: "#3f7c2f" },
+    6: { top: "#e7d9a0", side: "#e7d9a0", bottom: "#e7d9a0" },
+    7: { top: "#3f7dd6", side: "#3f7dd6", bottom: "#3f7dd6" },
+    8: { top: "#eef4ff", side: "#eef4ff", bottom: "#eef4ff" },
+    9: { top: "#e05a20", side: "#e05a20", bottom: "#e05a20" }
+  };
   function selectSlot(i) {
     selected = i;
     var slots = hotbarEl.children;
@@ -989,6 +882,7 @@ g.ClonecraftCore = API;
     world.set(hit.block[0], hit.block[1], hit.block[2], C.BLK.AIR);
     sound.play("break");                                   // round2b: ljudeffekt
     showMsg("Bröt " + blockName(id));
+    saveGame();                                            // T4-save: persist on change
   }
 
   document.addEventListener("mousedown", function (e) {
@@ -1017,6 +911,7 @@ g.ClonecraftCore = API;
     world.set(bx, by, bz, id);
     sound.play("place");                                   // round2b: ljudeffekt
     showMsg("Placerade " + blockName(id));
+    saveGame();                                            // T4-save: persist on change
   }
 
   var msgTimer = null;
@@ -1027,17 +922,20 @@ g.ClonecraftCore = API;
     msgTimer = setTimeout(function () { msgEl.classList.remove("show"); }, 1500);
   }
 
-  /* ---------- block textures (tiled, from colors + shade) ---------- */
+  /* ---------- block textures (procedural per-face, T1-tex) ---------- */
   var TEXTURES = {};
+  var AXES = ["top", "side", "bottom"];
   function makeTextures() {
     var size = 64;
-    function tex(id) {
-      var base = blockColor(id);
+    function texFace(id, axis) {
+      var face = FACE_MAP[id] || {};
+      var base = face[axis] || blockColor(id) || "#000";
       var c = document.createElement("canvas");
       c.width = size; c.height = size;
       var g = c.getContext("2d");
       g.fillStyle = base; g.fillRect(0, 0, size, size);
-      var rnd = C.createRng(id * 131 + 7);
+      var seed = id * 131 + (axis === "top" ? 7 : (axis === "bottom" ? 29 : 53));
+      var rnd = C.createRng(seed);
       for (var i = 0; i < 220; i++) {
         g.fillStyle = "rgba(0,0,0," + (0.04 + rnd() * 0.06) + ")";
         g.fillRect(Math.floor(rnd() * size), Math.floor(rnd() * size), 2, 2);
@@ -1047,11 +945,13 @@ g.ClonecraftCore = API;
       if (id === C.BLK.SNOW) { g.fillStyle = "rgba(255,255,255,.7)"; g.fillRect(0,0,size,size); }
       return c;
     }
-    for (var id = 1; id <= 9; id++) TEXTURES[id] = tex(id);
+    for (var id = 1; id <= 9; id++)
+      for (var ai = 0; ai < AXES.length; ai++) TEXTURES[id + ":" + AXES[ai]] = texFace(id, AXES[ai]);
   }
   makeTextures();
+  function faceTexture(id, axis) { return TEXTURES[id + ":" + (axis || "side")]; }
 
-  function drawFace(pts, id, shade) {
+  function drawFace(pts, id, axis, shade) {
     ctx.save();
     ctx.beginPath();
     ctx.moveTo(pts[0], pts[1]);
@@ -1064,7 +964,13 @@ g.ClonecraftCore = API;
       ctx.fillStyle = "rgba(224,90,32,0.85)";
       ctx.fill();
     } else {
-      ctx.fillStyle = blockColor(id);
+      var tex = faceTexture(id, axis);
+      if (tex) {
+        var pat = ctx.createPattern(tex, "repeat");
+        ctx.fillStyle = pat || blockColor(id);
+      } else {
+        ctx.fillStyle = blockColor(id);
+      }
       ctx.fill();
       ctx.globalAlpha = 0.25 * shade;
       ctx.fillStyle = shade >= 0.95 ? "#fff" : "#000";
@@ -1103,9 +1009,13 @@ g.ClonecraftCore = API;
     coordsEl.textContent = Math.round(player.x) + ", " + Math.round(player.y) + ", " + Math.round(player.z);
     if (!showFPS) fpsEl.style.display = "none"; else fpsEl.style.display = "";
     if (!showCoords) coordsEl.style.display = "none"; else coordsEl.style.display = "";
+    // T3-hp: health/hunger HUD bars (0..20 -> 0..100%)
+    if (healthEl) healthEl.style.width = Math.round(player.health / 20 * 100) + "%";
+    if (hungerEl) hungerEl.style.width = Math.round(player.hunger / 20 * 100) + "%";
   }
 
   function update(dt) {
+    timeOfDay = (timeOfDay + dt / TIME_CYCLE) % 1;   // T2-sky: advance the day/night clock
     var f = cam.forward();
     var r = cam.right();
     var mx = 0, mz = 0;
@@ -1124,30 +1034,62 @@ g.ClonecraftCore = API;
     if (player.y < -8) {
       player.x = spawnX + 0.5; player.y = groundY + 1.5; player.z = spawnZ + 0.5;
       player.vx = player.vy = player.vz = 0;
-      showMsg("Föll ur världen — återställd");
+      player.damage(5);   // T3-hp: falling out of the world costs health
+      showMsg("Föll ur världen — återställd (-" + 5 + " hälsa)");
     }
+
+    /* ---------- T3-hp: hunger + health-regen ----------
+       Hunger slowly drains over time (minimal scope: no food sources yet, no death loop).
+       Health regenerates only while hunger is high (>= 18) — the "well-fed" regen rule. */
+    player.hunger = Math.max(0, player.hunger - dt / 40);           // full drain from 20 in ~13 min
+    if (player.hunger >= 18 && player.health < 20) {
+      player.health = Math.min(20, player.health + dt / 6);         // regen ~1 hp per 6s when fed
+    }
+
+    // T4-save: throttled periodic save (~every 5s of play) captures movement/rot/timeOfDay
+    // even when no block is placed/broken.
+    lastSaveT += dt;
+    if (lastSaveT >= 5) { lastSaveT = 0; saveGame(); }
   }
 
   function render() {
     var w = canvas.width / (window.devicePixelRatio || 1);
     var h = canvas.height / (window.devicePixelRatio || 1);
+    // T2-sky: gradient stops driven by the day/night clock (was a fixed 2-stop gradient)
     var sky = ctx.createLinearGradient(0, 0, 0, h);
-    sky.addColorStop(0, "#79b6f2"); sky.addColorStop(1, "#cfe7fb");
+    var stops = A.skyGradient(timeOfDay);
+    for (var si = 0; si < stops.length; si++) sky.addColorStop(stops[si][0], stops[si][1]);
     ctx.fillStyle = sky; ctx.fillRect(0, 0, w, h);
+
+    // T2-sky: sun/moon disk — the sun crosses the sky by day, the moon by night.
+    // Ecliptic is a horizontal arc; y from the sine of the sun's height (1=zenith, -1=below).
+    ctx.save();
+    var sunAngle = (timeOfDay - 0.25) * Math.PI * 2;
+    var sunH = Math.sin(sunAngle);                        // -1 (midnight) .. 1 (noon)
+    var diskX = w * (0.5 + 0.38 * Math.cos(sunAngle));    // moves across the horizon line
+    var diskY = h * (0.28 - 0.22 * sunH);                 // rises/falls with the sun's height
+    var isDay = sunH > 0;
+    ctx.beginPath();
+    ctx.arc(diskX, diskY, Math.max(10, w * 0.045), 0, Math.PI * 2);
+    ctx.fillStyle = isDay ? "rgba(255,241,170,0.95)" : "rgba(226,232,255,0.92)";
+    ctx.fill();
+    if (!isDay) { ctx.fillStyle = "rgba(60,70,110,0.25)"; ctx.beginPath(); ctx.arc(diskX - 4, diskY - 3, Math.max(8, w * 0.036), 0, Math.PI * 2); ctx.fill(); }
+    ctx.restore();
 
     var hit = aimTarget();
     var highlight = hit ? { block: hit.block } : null;
 
     var fov = 380;
-    var solids = A.buildQuads(world, cam, cam.pos[0], cam.pos[1], cam.pos[2], REACH);
-    var fluid = A.buildWater(world, cam, cam.pos[0], cam.pos[1], cam.pos[2], REACH);
+    var m = A.skyLight(timeOfDay);   // T2-sky: dynamic shade multiplier (function of clock)
+    var solids = A.buildQuads(world, cam, cam.pos[0], cam.pos[1], cam.pos[2], REACH, m);
+    var fluid = A.buildWater(world, cam, cam.pos[0], cam.pos[1], cam.pos[2], REACH, m);
 
     solids.sort(function (q1, q2) { return A.quadDistance(q2, cam) - A.quadDistance(q1, cam); });
     for (var i = 0; i < solids.length; i++) {
       var q = solids[i];
       var pts = A.projectQuad(q, cam, fov, w, h);
       if (!pts) continue;
-      drawFace(pts, q.color, q.shade);
+      drawFace(pts, q.color, q.axis, q.shade);
       if (highlight && q.cx === highlight.block[0] + 0.5 && q.cy === highlight.block[1] + 0.5 && q.cz === highlight.block[2] + 0.5) {
         ctx.strokeStyle = "rgba(0,0,0,0.7)";
         ctx.lineWidth = 3;
@@ -1159,7 +1101,7 @@ g.ClonecraftCore = API;
       var wq = fluid[wi];
       var wpts = A.projectQuad(wq, cam, fov, w, h);
       if (!wpts) continue;
-      drawFace(wpts, wq.color, wq.shade);
+      drawFace(wpts, wq.color, wq.axis, wq.shade);
     }
   }
 
@@ -1232,7 +1174,12 @@ g.ClonecraftCore = API;
         world.set(hit.block[0], hit.block[1], hit.block[2], orig);
       }
 
-      // render: prove pixels show real terrain (sky above, terrain below)
+      // render: prove pixels show real terrain (sky above, terrain below).
+      // T2-sky: pin the clock to noon for this render proof so the gradient is bright
+      // blue (the pre-existing sky heuristic) regardless of the seed's initial phase —
+      // otherwise a dawn/night default sky trips the skyTop check even though the sky
+      // renders correctly. The cycle itself is now the clock + shadeMul (out.sky above).
+      timeOfDay = 0.5;
       var w = canvas.width, h = canvas.height;
       render();
       function px(sx, sy) {
@@ -1252,6 +1199,13 @@ g.ClonecraftCore = API;
       out.render.skyTopSamples = skyTop;
       out.render.terrainBotSamples = terrainBot;
       out.render.provesTerrain = skyTop > 0 && terrainBot > 0;
+
+      // T2-sky: day/night clock is present and the world-light multiplier is a function
+      // of time, not a bare constant. (Pause-awareness is structural: the loop only calls
+      // update() — where the clock advances — when `started && !paused`.)
+      var tod = +timeOfDay.toFixed(4);
+      out.sky = { timeOfDay: tod, shadeMul: +A.skyLight(timeOfDay).toFixed(4),
+                  clockIsFunction: typeof A.skyLight === "function" };
 
       // round 2b — pause: F5 toggles the overlay + simulation halt
       var pe = new KeyboardEvent("keydown", { code: "F5", key: "F5", bubbles: true });
