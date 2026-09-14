@@ -90,6 +90,14 @@
     transition:filter .15s; touch-action:manipulation; }
   #pause #resume:hover { filter:brightness(1.08); }
   #pause #resume:focus-visible { outline:3px solid #9bc1ff; outline-offset:2px; }
+  /* PHASE-5 (M3/M4): inventory panel reuses the pause overlay pattern */
+  #inventory { position:fixed; inset:0; z-index:30; display:flex; align-items:center;
+    justify-content:center; background:rgba(8,10,14,.7); backdrop-filter:blur(4px);
+    opacity:0; pointer-events:none; transition:opacity .2s ease; }
+  #inventory.show { opacity:1; pointer-events:auto; }
+  #inv-list { font-size:15px; line-height:1.7; min-height:1.7em; }
+  #inventory #inv-close { margin-top:14px; padding:10px 20px; font-size:15px; font-weight:600;
+    cursor:pointer; background:var(--accent); color:#fff; border:0; border-radius:9px; }
   #selfcheck-out { position:fixed; left:-9999px; top:0; } /* offscreen; read via dump-dom */
 
   /* round 2b — pause overlay */
@@ -115,7 +123,8 @@
        <span class="kbd">1–9</span> välj block &nbsp; <span class="kbd">Vänster</span> bryt &nbsp;
        <span class="kbd">Höger</span> placera<br>
        <span class="kbd">F2</span> fps &nbsp; <span class="kbd">F3</span> koordinater &nbsp;
-       <span class="kbd">F5</span> paus &nbsp; <span class="kbd">M</span> ljud<br>
+       <span class="kbd">F5</span> paus &nbsp; <span class="kbd">M</span> ljud &nbsp;
+       <span class="kbd">E</span> inventarie<br>
        <span class="kbd">#tall</span> i adressfältet väljer en annan värld</p>
     <p style="font-size:12px">På mobil: ena fingret styr rörelse (WASD), tvåa fingret tittar.
        Knapparna till höger bryter och placerar.</p>
@@ -129,6 +138,16 @@
     <p>Simuleringen står still — världen har pausats.</p>
     <p><span class="kbd">F5</span> fortsätt &nbsp; <span class="kbd">Esc</span> fortsätt</p>
     <button id="resume" type="button">Fortsätt</button>
+  </div>
+</div>
+
+<!-- PHASE-5 (M3/M4): inventory panel — same overlay pattern as #pause -->
+<div id="inventory" role="dialog" aria-modal="true" aria-labelledby="inv-tit" aria-hidden="true">
+  <div class="pause-panel">
+    <h2 id="inv-tit">Inventarie</h2>
+    <p id="inv-list" aria-live="polite">Tomt</p>
+    <p><span class="kbd">E</span> stäng &nbsp; <span class="kbd">Esc</span> stäng</p>
+    <button id="inv-close" type="button">Stäng</button>
   </div>
 </div>
 
@@ -344,6 +363,75 @@ function fallDamage(fallDist) {
   return Math.max(0, Math.floor(fallDist - 3));
 }
 
+/* ---------------- M3/M4: item inventory + 2x2 crafting (PHASE-5) ----------------
+   Items are block ids 1..9 plus two inventory-only ITEM ids (10 crafting table,
+   11 sticks) — outside the placeable BLK range so placeBlock can refuse them.
+   Pure Core: no DOM, deterministic, node-testable (same pattern as HARDNESS). */
+var ITEM = { CRAFTING_TABLE: 10, STICK: 11 };
+
+function Inventory() { this.items = {}; }
+Inventory.prototype.count = function (id) { return this.items[id] || 0; };
+Inventory.prototype.add = function (id, n) {
+  if (typeof n !== "number" || n <= 0) return this.count(id);      // no phantom items
+  if (typeof id !== "number" || id < 1 || id > ITEM.STICK) return 0; // AIR/unknown are not items
+  this.items[id] = (this.items[id] || 0) + n;
+  return this.items[id];
+};
+Inventory.prototype.take = function (id, n) {
+  if (typeof n !== "number" || n <= 0) return false;
+  if ((this.items[id] || 0) < n) return false;
+  this.items[id] -= n;
+  if (this.items[id] === 0) delete this.items[id];
+  return true;
+};
+/* Serialize as a plain {id:count} object; fromJSON defaults EMPTY on any
+   missing/garbage payload — that is the v1-save backward-compat contract. */
+Inventory.prototype.toJSON = function () {
+  var out = {}, id;
+  for (id in this.items) if (this.items[id] > 0) out[id] = this.items[id];
+  return out;
+};
+Inventory.fromJSON = function (data) {
+  var inv = new Inventory(), id;
+  if (!data || typeof data !== "object") return inv;
+  for (id in data) {
+    var n = data[id], iid = parseInt(id, 10);
+    if (typeof n === "number" && n > 0 && iid >= 1 && iid <= ITEM.STICK) inv.items[iid] = n;
+  }
+  return inv;
+};
+
+/* 2x2 crafting. grid = [[a,b],[c,d]] of ids (0 = empty cell).
+   Recipes (real-MC shapes, research 1193.1):
+   - 4 WOOD in a square -> 1 crafting table
+   - 2 WOOD stacked vertically -> 4 sticks
+   Shape matters: a partial or wrong-material grid crafts nothing.
+   On a match: consume the grid materials from `inv`, grant the result,
+   return the result id; return 0 when nothing matched. */
+var RECIPES = [
+  { shape: [[4, 4], [4, 4]], result: ITEM.CRAFTING_TABLE, count: 1 },
+  { shape: [[4, 0], [4, 0]], result: ITEM.STICK, count: 4 }
+];
+function craft(grid, inv) {
+  if (!Array.isArray(grid) || grid.length !== 2 ||
+      !Array.isArray(grid[0]) || !Array.isArray(grid[1]) ||
+      grid[0].length !== 2 || grid[1].length !== 2) return 0;
+  for (var r = 0; r < RECIPES.length; r++) {
+    var rec = RECIPES[r], need = {}, ok = true, x, y;
+    for (y = 0; y < 2 && ok; y++) for (x = 0; x < 2; x++) {
+      if (grid[y][x] !== rec.shape[y][x]) { ok = false; break; }
+      if (grid[y][x] !== 0) need[grid[y][x]] = (need[grid[y][x]] || 0) + 1;
+    }
+    if (!ok) continue;
+    for (var id in need) if (inv.count(+id) < need[id]) { ok = false; break; }
+    if (!ok) continue;
+    for (var id2 in need) inv.take(+id2, need[id2]);
+    inv.add(rec.result, rec.count);
+    return rec.result;
+  }
+  return 0;
+}
+
 function collides(world, px, py, pz) {
   var x0 = Math.floor(px - PLAYER.W), x1 = Math.floor(px + PLAYER.W);
   var y0 = Math.floor(py), y1 = Math.floor(py + PLAYER.H * 2);
@@ -490,6 +578,7 @@ var API = {
   collides: collides, Player: Player, raycast: raycast,
   PLAYER: PLAYER, GRAVITY: GRAVITY, JUMP_V: JUMP_V, WALK: WALK, SPRINT: SPRINT,
   SNEAK: SNEAK, fallDamage: fallDamage,
+  ITEM: ITEM, Inventory: Inventory, RECIPES: RECIPES, craft: craft,
   Sound: Sound
 };
 if (typeof module !== "undefined" && module.exports) { module.exports = API; }
@@ -713,6 +802,12 @@ g.ClonecraftCore = API;
   var SAVE_KEY = "clonecraft.save.v1";
   var lastSaveT = 0;                    // throttled periodic save (every SAVE_INTERVAL s)
 
+  /* ---------- M4: item inventory (PHASE-5) ----------
+     One live Inventory. HOTBAR stays the 9 placeable block ids (selftest
+     contract); placeBlock consumes from the inventory, breakBlockAt grants
+     drops. Fluids (WATER/LAVA) yield no drop — you cannot pocket a fluid. */
+  var inventory = new C.Inventory();
+
   function saveGame() {
     try {
       var arr = world.data, i, bin = "";
@@ -722,7 +817,8 @@ g.ClonecraftCore = API;
         player: { x: player.x, y: player.y, z: player.z,
                   yaw: cam.yaw, pitch: cam.pitch,
                   health: player.health, hunger: player.hunger },
-        timeOfDay: timeOfDay
+        timeOfDay: timeOfDay,
+        items: inventory.toJSON()          // PHASE-5: optional field — v1 payloads without it load with items defaulted empty
       }));
       return true;
     } catch (e) { return false; }   // quota / private mode — save is best-effort
@@ -753,6 +849,9 @@ g.ClonecraftCore = API;
         cam.pos = [player.x, player.y + 1.55, player.z];
       }
       if (typeof s.timeOfDay === "number") timeOfDay = s.timeOfDay;
+      // PHASE-5: items are an OPTIONAL field — a v1 payload without it loads
+      // with an empty inventory (invariant 3: never a silent format change).
+      inventory = C.Inventory.fromJSON(s.items);
       showMsg("Laddade sparad värld");
       return true;
     } catch (e) { return false; }
@@ -791,6 +890,35 @@ g.ClonecraftCore = API;
     if (!sound.muted) sound.resume();
     if (msgEl) showMsg(sound.muted ? "Ljud av (M)" : "Ljud på (M)");
   }
+
+  /* ---------- inventory panel (PHASE-5, M3/M4) ----------
+     Same overlay pattern as #pause: .show class + aria-hidden, E toggles,
+     Esc closes. The 2x2 craft grid is a Core function (C.craft) proven by
+     tests/core-craft.test.js; this panel is the item VIEW (M4). */
+  var invOverlay = document.getElementById("inventory");
+  var invListEl = document.getElementById("inv-list");
+  var invOpen = false;
+  function itemName(id) {
+    if (id === C.ITEM.CRAFTING_TABLE) return "crafting table";
+    if (id === C.ITEM.STICK) return "pinnar";
+    return blockName(id);
+  }
+  function renderInventory() {
+    var parts = [], id;
+    var items = inventory.toJSON();
+    for (id in items) parts.push(items[id] + " × " + itemName(+id));
+    invListEl.textContent = parts.length ? parts.join(" · ") : "Tomt";
+  }
+  function setInvOpen(v) {
+    invOpen = v;
+    if (v) renderInventory();
+    if (invOverlay) {
+      invOverlay.classList.toggle("show", v);
+      invOverlay.setAttribute("aria-hidden", v ? "false" : "true");
+    }
+  }
+  var invCloseBtn = document.getElementById("inv-close");
+  if (invCloseBtn) invCloseBtn.addEventListener("click", function () { setInvOpen(false); });
 
   /* ---------- input ---------- */
   var keys = {};
@@ -864,6 +992,8 @@ g.ClonecraftCore = API;
     }
     if (e.code === "F5") { e.preventDefault(); setPaused(!paused); }     // round2b: paus
     if (e.code === "KeyM") { e.preventDefault(); toggleSound(); }        // round2b: ljud
+    if (e.code === "KeyE") { e.preventDefault(); setInvOpen(!invOpen); } // PHASE-5: inventarie
+    if (e.code === "Escape" && invOpen) setInvOpen(false);               // PHASE-5: esc stänger inventarie
     if (e.code === "Escape" && paused) setPaused(false);                // round2b: esc stänger paus
   });
   document.addEventListener("keyup", function (e) { keys[e.code] = false; });
@@ -971,6 +1101,9 @@ g.ClonecraftCore = API;
   function breakBlockAt(hit) {
     var id = world.get(hit.block[0], hit.block[1], hit.block[2]);
     world.set(hit.block[0], hit.block[1], hit.block[2], C.BLK.AIR);
+    // PHASE-5 (M4): breaking yields the block into the inventory — except
+    // fluids, which cannot be pocketed.
+    if (id !== C.BLK.WATER && id !== C.BLK.LAVA) inventory.add(id, 1);
     sound.play("break");                                   // round2b: ljudeffekt
     showMsg("Bröt " + blockName(id));
     saveGame();                                            // T4-save: persist on change
@@ -999,6 +1132,11 @@ g.ClonecraftCore = API;
     var id = HOTBAR[selected];
     if (world.get(bx, by, bz) !== C.BLK.AIR) return;
     if (C.collides(world, player.x, player.y, player.z)) return;
+    // PHASE-5 (M4): placing consumes from the inventory. With an empty
+    // inventory the hotbar still works in creative spirit (no gate yet —
+    // the brief's DoD is the item model + save extension, not survival
+    // scarcity), so a zero count places without consuming.
+    if (inventory.count(id) > 0) inventory.take(id, 1);
     world.set(bx, by, bz, id);
     sound.play("place");                                   // round2b: ljudeffekt
     showMsg("Placerade " + blockName(id));
@@ -1405,6 +1543,56 @@ g.ClonecraftCore = API;
       var keyIdx = (activeBefore + 5) % 9;   // Digit1..9
       document.dispatchEvent(new KeyboardEvent("keydown", { code: "Digit" + (keyIdx + 1), key: String(keyIdx + 1), bubbles: true }));
       out.input.slotKeySel = selected === keyIdx;
+
+      // PHASE-5 (MC 1193.11): item inventory + crafting + save extension.
+      // (a) hotbar contract intact: still 9 placeable slots;
+      out.craft = {};
+      out.craft.hotbarSlots = hotbarEl.children.length;
+      // (b) break grants a drop into the inventory (edit roundtrip block above
+      //     already restored the world, so break the same aim target again);
+      var invBefore = inventory.count(orig);
+      var hit2 = C.raycast(world, player.x, player.y + 8, player.z, 0, -1, 0, 20);
+      if (hit2) breakBlockAt(hit2);
+      out.craft.breakGrantsItem = !!hit2 && inventory.count(orig) === invBefore + 1;
+      // (c) place consumes from the inventory when stocked;
+      // select the hotbar slot matching `orig` first — the slot-key probe above
+      // left `selected` on an unrelated block, so placeBlock would place the
+      // wrong id and consume nothing (gate 1193.12: placeConsumes was false).
+      var origSlot = HOTBAR.indexOf(orig);
+      if (origSlot >= 0) selectSlot(origSlot);
+      var place2 = hit2 ? hit2.place : null;
+      if (place2) {
+        var invBeforePlace = inventory.count(orig);
+        placeBlock(place2[0], place2[1], place2[2]);
+        out.craft.placeConsumes = inventory.count(orig) === invBeforePlace - 1;
+        // restore the world exactly (the place above set `orig` at place2)
+        world.set(place2[0], place2[1], place2[2], C.BLK.AIR);
+      } else { out.craft.placeConsumes = false; }
+      // (d) 2x2 craft: 4 wood -> crafting table via the Core recipe set;
+      var craftInv = new C.Inventory();
+      craftInv.add(C.BLK.WOOD, 4);
+      out.craft.tableFrom4Wood = C.craft([[C.BLK.WOOD, C.BLK.WOOD], [C.BLK.WOOD, C.BLK.WOOD]], craftInv) === C.ITEM.CRAFTING_TABLE
+                                 && craftInv.count(C.ITEM.CRAFTING_TABLE) === 1 && craftInv.count(C.BLK.WOOD) === 0;
+      // (e) save extension: items serialize; a v1 payload WITHOUT items loads empty.
+      // The live inventory is empty here (break granted +1, place consumed -1),
+      // so prove serialization on a stocked probe inventory instead.
+      var serInv = new C.Inventory();
+      serInv.add(C.BLK.WOOD, 3);
+      serInv.add(C.ITEM.STICK, 2);
+      var serJson = serInv.toJSON();
+      out.craft.itemsSerialize = serJson[C.BLK.WOOD] === 3 && serJson[C.ITEM.STICK] === 2
+                                 && Object.keys(C.Inventory.fromJSON(serJson).toJSON()).length === 2;
+      // grid bytes via a loop — Function.prototype.apply over the 442k-cell
+      // world overflows the call stack (RangeError, gate 1193.12).
+      var binStr = "";
+      for (var gi = 0; gi < world.data.length; gi++) binStr += String.fromCharCode(world.data[gi]);
+      var v1payload = { v: 1, seed: SEED, grid: btoa(binStr),
+                        player: { x: player.x, y: player.y, z: player.z }, timeOfDay: 0.5 };
+      var probeInv = C.Inventory.fromJSON(v1payload.items);
+      out.craft.v1LoadsEmpty = probeInv.count(C.BLK.WOOD) === 0 && probeInv.count(C.ITEM.STICK) === 0;
+      out.craft.ok = out.craft.hotbarSlots === 9 && out.craft.breakGrantsItem &&
+                     out.craft.placeConsumes && out.craft.tableFrom4Wood &&
+                     out.craft.itemsSerialize && out.craft.v1LoadsEmpty;
     } catch (e) {
       out.selftest = "FAIL";
       out.error = e.message;
