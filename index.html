@@ -273,6 +273,59 @@ World.prototype._generate = function () {
       }
     }
   }
+  /* ---------------- PHASE-4: caves — seeded 3D noise carve (MC 1193.9) ----------------
+     3D value noise (two octaves, bilinear+trilinear smoothing) sampled at every
+     underground voxel; carve where the field exceeds the threshold. The rng that
+     fills the noise grid is createRng(seed ^ CAVE_SEED_XOR) — a DEDICATED seeded
+     stream, never Math.random — so the same seed rebuilds a byte-identical world
+     (selftest determinism invariant). Constraints:
+       - y=0 bedrock row is never carved;
+       - the lava band rows [LAVA_TOP-2, LAVA_TOP] are never carved;
+       - only voxels strictly below the column's terrain surface are carved
+         (no sky craters), and only solid rock/soil is replaced. */
+  var CAVE_SEED_XOR = 0x5eed1234;
+  var CAVE_SCALE1 = 0.09;   // large caverns
+  var CAVE_SCALE2 = 0.18;   // detail
+  var CAVE_THRESHOLD = 0.72;
+  var LAVA_TOP = Math.floor(h * 0.22);
+  var caveRng = createRng((this.seed ^ CAVE_SEED_XOR) >>> 0);
+  var cg = new Array(32 * 32 * 32);
+  for (var ci = 0; ci < cg.length; ci++) cg[ci] = caveRng();
+  function caveHash(ix, iy, iz) {
+    return cg[((iz & 31) * 32 + (iy & 31)) * 32 + (ix & 31)];
+  }
+  function caveNoise(fx, fy, fz) {
+    var x0 = Math.floor(fx), y0 = Math.floor(fy), z0 = Math.floor(fz);
+    var sx = fx - x0, sy = fy - y0, sz = fz - z0;
+    sx = sx * sx * (3 - 2 * sx); sy = sy * sy * (3 - 2 * sy); sz = sz * sz * (3 - 2 * sz);
+    var c000 = caveHash(x0, y0, z0),     c100 = caveHash(x0 + 1, y0, z0);
+    var c010 = caveHash(x0, y0 + 1, z0), c110 = caveHash(x0 + 1, y0 + 1, z0);
+    var c001 = caveHash(x0, y0, z0 + 1), c101 = caveHash(x0 + 1, y0, z0 + 1);
+    var c011 = caveHash(x0, y0 + 1, z0 + 1), c111 = caveHash(x0 + 1, y0 + 1, z0 + 1);
+    var x00 = c000 + (c100 - c000) * sx, x10 = c010 + (c110 - c010) * sx;
+    var x01 = c001 + (c101 - c001) * sx, x11 = c011 + (c111 - c011) * sx;
+    var y0v = x00 + (x10 - x00) * sy, y1v = x01 + (x11 - x01) * sy;
+    return y0v + (y1v - y0v) * sz;
+  }
+  for (var cx = 0; cx < w; cx++) {
+    for (var cz = 0; cz < d; cz++) {
+      // per-column terrain surface (topmost grass/sand/snow) — carve only below it
+      var ctop = -1;
+      for (var cy = h - 1; cy >= 0; cy--) {
+        var cb = this.data[this._idx(cx, cy, cz)];
+        if (cb === BLK.GRASS || cb === BLK.SAND || cb === BLK.SNOW) { ctop = cy; break; }
+      }
+      for (var cy2 = 1; cy2 < ctop; cy2++) {
+        if (cy2 >= LAVA_TOP - 2 && cy2 <= LAVA_TOP) continue;   // lava band: intact
+        var idx2 = this._idx(cx, cy2, cz);
+        var id2 = this.data[idx2];
+        if (id2 !== BLK.STONE && id2 !== BLK.DIRT) continue;    // only rock/soil
+        var n1 = caveNoise(cx * CAVE_SCALE1, cy2 * CAVE_SCALE1, cz * CAVE_SCALE1);
+        var n2c = caveNoise(cx * CAVE_SCALE2 + 100, cy2 * CAVE_SCALE2 + 100, cz * CAVE_SCALE2 + 100);
+        if (n1 * 0.65 + n2c * 0.35 > CAVE_THRESHOLD) this.data[idx2] = BLK.AIR;
+      }
+    }
+  }
 };
 
 /* ---------------- physics / collision (AABB vs voxel grid) ---------------- */
@@ -1195,6 +1248,27 @@ g.ClonecraftCore = API;
       out.seed.value = SEED;
       out.seed.seedOverride = diff;
       out.seed.defaultIs20260826 = (SEED === 20260826);
+      // PHASE-4 caves (MC 1193.9): determinism WITH caves + carve stats.
+      // The rebuild above (w2) already includes the carve pass, so `same`
+      // proves byte-identical grids WITH caves enabled. Additionally: bedrock
+      // row intact, lava band intact, and caves actually exist underground.
+      out.caves = {};
+      var caveLavaTop = Math.floor(WORLD_H * 0.22);
+      var bedrockIntact = true, lavaIntact = 0, caveAir = 0;
+      for (var cx2 = 0; cx2 < WORLD_W; cx2++) {
+        for (var cz2 = 0; cz2 < WORLD_D; cz2++) {
+          if (world.get(cx2, 0, cz2) !== C.BLK.STONE) bedrockIntact = false;
+          for (var cy3 = caveLavaTop - 2; cy3 <= caveLavaTop; cy3++)
+            if (world.get(cx2, cy3, cz2) === C.BLK.LAVA) lavaIntact++;
+          for (var cy4 = 1; cy4 < caveLavaTop - 2; cy4++)
+            if (world.get(cx2, cy4, cz2) === C.BLK.AIR) caveAir++;
+        }
+      }
+      out.caves.deterministicWithCaves = same;
+      out.caves.bedrockIntact = bedrockIntact;
+      out.caves.lavaBandBlocks = lavaIntact;
+      out.caves.undergroundAir = caveAir;
+      out.caves.ok = same && bedrockIntact && lavaIntact > 0 && caveAir > 0;
 
       // physics: player falls to ground, lands, onGround
       var p = new C.Player(world, spawnX + 0.5, WORLD_H + 4, spawnZ + 0.5);
