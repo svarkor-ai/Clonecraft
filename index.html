@@ -432,6 +432,151 @@ function craft(grid, inv) {
   return 0;
 }
 
+/* ---------------- M10: mobs — darkness spawn rule + chase AI (PHASE-7) ----------------
+   Two kinds: "passive" (wanders in daylight) and "hostile" (spawns only in the
+   dark — a solid cover above the spawn cell — and chases its target).
+   Pure Core: no DOM, deterministic (spawning takes a seeded rng, never
+   Math.random — invariant 1), node-testable. Movement reuses the existing AABB
+   collision (collides) exactly like Player.move. */
+var MOB = {
+  DARK_LEVEL: 7,      // hostile spawn rule: sky light < 7 (covered column)
+  CHASE_SPEED: 2.4,   // hostile chase speed (m/s), slower than the player's walk
+  WANDER_SPEED: 1.1,  // passive wander speed
+  CHASE_RANGE: 12     // hostile starts chasing within this distance
+};
+
+/* Sky-exposure scan: true when NO solid block sits above (x, y, z) up to the
+   world top — the cheap "is there sky light here" check from arch map S5 (no
+   full light engine). Out-of-bounds columns are NOT exposed (safe default). */
+function skyExposed(world, x, y, z) {
+  if (x < 0 || y < 0 || z < 0 || x >= world.w || y >= world.h || z >= world.d) return false;
+  for (var yy = y + 1; yy < world.h; yy++) {
+    var id = world.get(x, yy, z);
+    if (id !== BLK.AIR && id !== BLK.WATER && id !== BLK.LAVA) return false;
+  }
+  return true;
+}
+
+function Mob(world, x, y, z, kind) {
+  this.world = world;
+  this.x = x; this.y = y; this.z = z;   // feet-center position (same as Player)
+  this.vx = 0; this.vy = 0; this.vz = 0;
+  this.onGround = false;
+  this.kind = (kind === "hostile") ? "hostile" : "passive";
+  this.target = null;                    // {x, y, z} — hostile chases it
+  this._wanderT = 0;                     // wander-direction timer
+  this._wx = 0; this._wz = 0;            // current wander direction
+}
+
+/* Horizontal move with the shared AABB collision (mirrors Player.move's
+   axis-separated resolve; mobs are PLAYER-sized — collides is world-only). */
+Mob.prototype._moveH = function (dx, dz) {
+  if (dx !== 0) {
+    this.x += dx;
+    if (collides(this.world, this.x, this.y, this.z)) { this.x -= dx; this.vx = 0; }
+  }
+  if (dz !== 0) {
+    this.z += dz;
+    if (collides(this.world, this.x, this.y, this.z)) { this.z -= dz; this.vz = 0; }
+  }
+};
+
+Mob.prototype.step = function (dt) {
+  // gravity + vertical resolve (same pattern as Player.step: the move() helper
+  // sets onGround on a downward collision, clears it on a free fall)
+  this.vy -= GRAVITY * dt;
+  if (this.vy < -48) this.vy = -48;
+  var dy = this.vy * dt;
+  this.y += dy;
+  if (collides(this.world, this.x, this.y, this.z)) {
+    this.y -= dy;
+    if (dy < 0) this.onGround = true;
+    this.vy = 0;
+  } else if (dy < 0) {
+    this.onGround = false;
+  }
+  // pick a heading: hostile chases the target in range, otherwise wander
+  var speed = MOB.WANDER_SPEED;
+  if (this.kind === "hostile" && this.target) {
+    var dx = this.target.x - this.x, dz = this.target.z - this.z;
+    var dist = Math.sqrt(dx * dx + dz * dz);
+    if (dist < MOB.CHASE_RANGE && dist > 0.05) {
+      this._wx = dx / dist; this._wz = dz / dist;
+      speed = MOB.CHASE_SPEED;
+      this._wanderT = 0.5;   // keep the chase heading between steps
+    }
+  }
+  if (this._wanderT <= 0) {
+    // new wander direction every ~2s. A mob without an injected rng still gets a
+    // deterministic default stream (seeded from its spawn coords) so it moves —
+    // a mob that never wanders is a dead mob (test L94: moved > 0 required).
+    if (!this._rng) this.setRng(createRng((this.x * 31 + this.z * 17) | 0 || 1));
+    this._wx = this._rng() * 2 - 1;
+    this._wz = this._rng() * 2 - 1;
+    var wl = Math.sqrt(this._wx * this._wx + this._wz * this._wz) || 1;
+    this._wx /= wl; this._wz /= wl;
+    this._wanderT = 2;
+  }
+  this._wanderT -= dt;
+  this.vx = this._wx * speed;
+  this.vz = this._wz * speed;
+  this._moveH(this.vx * dt, this.vz * dt);
+};
+
+/* Inject the seeded rng a mob uses for wander decisions (invariant 1:
+   determinism — the Runtime passes its seeded stream, never Math.random). */
+Mob.prototype.setRng = function (rng) { this._rng = rng; };
+
+/* Darkness spawn rule. Two passes, both bounded: FIRST a deterministic scan for
+   dark columns (covered = sky light < 7) — real MC actively seeks darkness for
+   hostile spawns, and a random scan can miss a lone dark column entirely; THEN
+   random columns with the given seeded rng for the open (passive) spawns. Each
+   spawn stands on solid ground in an AIR cell. Returns the spawned Mob instances. */
+function spawnMobs(world, rng, opts) {
+  opts = opts || {};
+  var count = opts.count || 10;
+  var out = [];
+  var attempts = count * 20;   // bounded scan: give up long before the frame budget
+  // Pass 1: deterministic dark-column scan (hostiles). A dark spot is an AIR cell
+  // with solid ground BELOW it and a COVER above it — i.e. a cave pocket or the
+  // space under an overhang, not just the top of a column. Scan every cell of the
+  // column above the floor: the first (lowest) dark AIR cell with solid ground
+  // under it is the hostile spawn. Bounded: full grid scan, O(w*d*h) worst case,
+  // acceptable at spawn time and it guarantees dark spots are USED, not missed.
+  for (var x = 0; x < world.w && out.length < count; x++) {
+    for (var z = 0; z < world.d && out.length < count; z++) {
+      for (var y = 1; y < world.h && out.length < count; y++) {
+        if (world.get(x, y, z) !== BLK.AIR) continue;          // must be air
+        if (world.get(x, y - 1, z) === BLK.AIR) continue;      // must stand on ground
+        if (world.get(x, y - 1, z) === BLK.WATER || world.get(x, y - 1, z) === BLK.LAVA) continue;
+        if (skyExposed(world, x, y, z)) continue;              // must be covered (dark)
+        var mobD = new Mob(world, x + 0.5, y, z + 0.5, "hostile");
+        mobD.setRng(rng);
+        out.push(mobD);
+      }
+    }
+  }
+  // Pass 2: random open columns (passives) until the count is met.
+  for (var i = 0; i < attempts && out.length < count; i++) {
+    var x2 = Math.floor(rng() * world.w);
+    var z2 = Math.floor(rng() * world.d);
+    // find the topmost solid block of the column
+    var top = -1;
+    for (var y = world.h - 1; y >= 0; y--) {
+      var id = world.get(x2, y, z2);
+      if (id !== BLK.AIR && id !== BLK.WATER && id !== BLK.LAVA) { top = y; break; }
+    }
+    if (top < 0 || top + 1 >= world.h) continue;
+    var sy = top + 1;
+    if (world.get(x2, sy, z2) !== BLK.AIR) continue;
+    if (!skyExposed(world, x2, sy, z2)) continue;   // dark column -> hostile pass owns it
+    var mob = new Mob(world, x2 + 0.5, sy, z2 + 0.5, "passive");
+    mob.setRng(rng);
+    out.push(mob);
+  }
+  return out;
+}
+
 function collides(world, px, py, pz) {
   var x0 = Math.floor(px - PLAYER.W), x1 = Math.floor(px + PLAYER.W);
   var y0 = Math.floor(py), y1 = Math.floor(py + PLAYER.H * 2);
@@ -579,6 +724,7 @@ var API = {
   PLAYER: PLAYER, GRAVITY: GRAVITY, JUMP_V: JUMP_V, WALK: WALK, SPRINT: SPRINT,
   SNEAK: SNEAK, fallDamage: fallDamage,
   ITEM: ITEM, Inventory: Inventory, RECIPES: RECIPES, craft: craft,
+  MOB: MOB, Mob: Mob, skyExposed: skyExposed, spawnMobs: spawnMobs,
   Sound: Sound
 };
 if (typeof module !== "undefined" && module.exports) { module.exports = API; }
