@@ -364,16 +364,23 @@ function fallDamage(fallDist) {
 }
 
 /* ---------------- M3/M4: item inventory + 2x2 crafting (PHASE-5) ----------------
-   Items are block ids 1..9 plus two inventory-only ITEM ids (10 crafting table,
-   11 sticks) — outside the placeable BLK range so placeBlock can refuse them.
-   Pure Core: no DOM, deterministic, node-testable (same pattern as HARDNESS). */
-var ITEM = { CRAFTING_TABLE: 10, STICK: 11 };
+   Items are block ids 1..9 plus inventory-only ITEM ids (10 crafting table,
+   11 sticks, 12 apple/food) — outside the placeable BLK range so placeBlock
+   can refuse them. Pure Core: no DOM, deterministic, node-testable (same
+   pattern as HARDNESS). */
+var ITEM = { CRAFTING_TABLE: 10, STICK: 11, FOOD: 12 };
+
+/* M5 food (PHASE-6, seam S8): hunger points one apple restores. The hunger
+   scale is 0..20 (T3-hp) and the well-fed regen threshold is 18 — one apple
+   from the worst state (5) must land back at/above the threshold, so the
+   restore is 13 (5 + 13 = 18). */
+var FOOD_RESTORE = 13;
 
 function Inventory() { this.items = {}; }
 Inventory.prototype.count = function (id) { return this.items[id] || 0; };
 Inventory.prototype.add = function (id, n) {
   if (typeof n !== "number" || n <= 0) return this.count(id);      // no phantom items
-  if (typeof id !== "number" || id < 1 || id > ITEM.STICK) return 0; // AIR/unknown are not items
+  if (typeof id !== "number" || id < 1 || id > ITEM.FOOD) return 0; // AIR/unknown are not items
   this.items[id] = (this.items[id] || 0) + n;
   return this.items[id];
 };
@@ -396,7 +403,7 @@ Inventory.fromJSON = function (data) {
   if (!data || typeof data !== "object") return inv;
   for (id in data) {
     var n = data[id], iid = parseInt(id, 10);
-    if (typeof n === "number" && n > 0 && iid >= 1 && iid <= ITEM.STICK) inv.items[iid] = n;
+    if (typeof n === "number" && n > 0 && iid >= 1 && iid <= ITEM.FOOD) inv.items[iid] = n;
   }
   return inv;
 };
@@ -636,7 +643,26 @@ Player.prototype.damage = function (n) {
   return this.health;
 };
 
+/* M5 food (PHASE-6, seam S8): eat one food item from `inv`.
+   Consumes exactly one ITEM.FOOD and raises hunger by FOOD_RESTORE, clamped
+   to the 0..20 scale. Returns the new hunger, or null when there is nothing
+   edible in `inv` (no phantom restore). Pure Core, node-testable. */
+Player.prototype.eat = function (inv) {
+  if (!inv || inv.count(ITEM.FOOD) < 1) return null;
+  inv.take(ITEM.FOOD, 1);
+  this.hunger = Math.min(20, this.hunger + FOOD_RESTORE);
+  return this.hunger;
+};
+
 Player.prototype.step = function (dt) {
+  // M5 well-fed regen FIRST (moved from the Runtime into Core so the rule is
+  // node-testable and pause-gated by the same step): health regenerates only
+  // while hunger >= 18, ~1 hp per 6 s, clamped to the 0..20 scale. Running it
+  // before the fall-damage block means a landing step applies damage cleanly —
+  // the regen never heals into the same step that hurts the player.
+  if (this.hunger >= 18 && this.health < 20 && this.onGround) {
+    this.health = Math.min(20, this.health + dt / 6);
+  }
   this.vy -= GRAVITY * dt;
   if (this.vy < -48) this.vy = -48;
   this.move(this.vx * dt, 0, this.vz * dt);
@@ -724,6 +750,7 @@ var API = {
   PLAYER: PLAYER, GRAVITY: GRAVITY, JUMP_V: JUMP_V, WALK: WALK, SPRINT: SPRINT,
   SNEAK: SNEAK, fallDamage: fallDamage,
   ITEM: ITEM, Inventory: Inventory, RECIPES: RECIPES, craft: craft,
+  FOOD_RESTORE: FOOD_RESTORE,
   MOB: MOB, Mob: Mob, skyExposed: skyExposed, spawnMobs: spawnMobs,
   Sound: Sound
 };
@@ -1418,8 +1445,9 @@ g.ClonecraftCore = API;
     }
 
     /* ---------- T3-hp: hunger + health-regen ----------
-       Hunger slowly drains over time (minimal scope: no food sources yet, no death loop).
-       Health regenerates only while hunger is high (>= 18) — the "well-fed" regen rule. */
+       Hunger slowly drains over time (PHASE-6: food restores it — see
+       Player.eat). Health regenerates only while hunger is high (>= 18) —
+       the "well-fed" regen rule. */
     player.hunger = Math.max(0, player.hunger - dt / 40);           // full drain from 20 in ~13 min
     if (player.hunger >= 18 && player.health < 20) {
       player.health = Math.min(20, player.health + dt / 6);         // regen ~1 hp per 6s when fed
