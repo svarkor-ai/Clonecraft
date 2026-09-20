@@ -363,6 +363,103 @@ function fallDamage(fallDist) {
   return Math.max(0, Math.floor(fallDist - 3));
 }
 
+/* ---------------- M2: hardness + timed breaking (tool = hand) ----------------
+   Real-Minecraft hand-mining base times (research 1193.1, minecraft.wiki):
+   base time = hardness * 1.5 s if the block is harvestable by hand, else * 5.
+   Hand tool speed is 1, so breakTime(id, "hand") = base time directly.
+   Fluids (WATER/LAVA) and unknown ids are unbreakable: breakTime = Infinity.
+   HARVESTABLE lists the ids a bare hand can harvest. Stone is NOT in it —
+   but per the SPEC (research 1193.1) a hand CAN still break stone slowly:
+   the non-harvestable path returns hardness * 5 (stone = 7.5 s), not
+   Infinity. Infinity is reserved for fluids, AIR and unknown ids. */
+var HARDNESS = { 1: 0.6, 2: 0.5, 3: 1.5, 4: 2.0, 5: 0.2, 6: 0.5, 7: 100, 8: 0.1, 9: 100 };
+var HARVESTABLE = { 1: true, 2: true, 4: true, 5: true, 6: true, 8: true };
+
+function breakTime(id, tool) {
+  var h = HARDNESS[id];
+  if (typeof h !== "number") return Infinity;          // AIR / unknown id
+  if (id === BLK.WATER || id === BLK.LAVA) return Infinity;   // fluids
+  var speed = (tool && tool.speed) || 1;               // hand speed = 1
+  return HARVESTABLE[id] ? h * 1.5 / speed : h * 5 / speed;
+}
+
+/* Hold-to-break progress: the Runtime advances one of these per update tick
+   while the aim is held on the same block; reset() on aim change (S1 seam).
+   Pure arithmetic lives here so node tests can prove it headless. */
+function BreakProgress(id) {
+  this.id = id;
+  this.total = breakTime(id);
+  this.progress = 0;
+}
+BreakProgress.prototype.tick = function (dt) {
+  if (this.total !== Infinity) this.progress += dt;
+  return this.progress;
+};
+BreakProgress.prototype.done = function () {
+  return this.total !== Infinity && this.progress >= this.total;
+};
+BreakProgress.prototype.reset = function () {
+  this.progress = 0;
+};
+
+/* ---------------- M8/M9: fluid flow — throttled cellular spread (PHASE-8) ----------------
+   Water spreads up to 7 blocks, one block every 5 game ticks; lava up to 3
+   blocks, one block every 30 ticks (research 1193.1, MC parity). Fluid ticks
+   live inside update() (invariant 4) and are fps-budgeted: tickFluids processes
+   at most FLUID.TICK_CAP cells per call and returns how many it updated, so the
+   Runtime can prove the frame budget holds. Pure Core: no DOM, deterministic
+   (fixed scan order, no rng — invariant 1), node-testable. */
+var FLUID = {
+  WATER_SPREAD: 7,     // M8: max horizontal spread from a source, in blocks
+  WATER_INTERVAL: 5,   // M8: game ticks between two spread steps
+  LAVA_SPREAD: 3,      // M9: max horizontal spread from a source, in blocks
+  LAVA_INTERVAL: 30,   // M9: game ticks between two spread steps
+  TICK_CAP: 64         // frame-budget guard: max cells updated per tickFluids call
+};
+
+/* One fluid tick over `world`. Every fluid cell counts down its own timer
+   (stored on the cell's meta map); when it fires the cell spreads one step:
+   DOWN into air first (gravity), else sideways into air, never into solids.
+   Spread distance is bounded by tracking each cell's remaining spread budget
+   (7 for water, 3 for lava) in the same meta map. Returns the number of cells
+   updated this tick (capped at FLUID.TICK_CAP). */
+function tickFluids(world) {
+  if (!world._fluidMeta) world._fluidMeta = {};   // idx -> {t: ticks-to-go, s: spread left}
+  var meta = world._fluidMeta;
+  var updated = 0;
+  for (var y = 0; y < world.h && updated < FLUID.TICK_CAP; y++) {
+    for (var z = 0; z < world.d && updated < FLUID.TICK_CAP; z++) {
+      for (var x = 0; x < world.w && updated < FLUID.TICK_CAP; x++) {
+        var id = world.get(x, y, z);
+        if (id !== BLK.WATER && id !== BLK.LAVA) continue;
+        var idx = world._idx(x, y, z);
+        var st = meta[idx];
+        if (!st) {   // first sighting: arm with t=0 — a fresh source fires THIS tick
+          st = meta[idx] = { t: 0,
+                             s: (id === BLK.WATER) ? FLUID.WATER_SPREAD : FLUID.LAVA_SPREAD };
+        }
+        if (st.t > 0) { st.t--; continue; }   // throttled: not this tick
+        // timer fired — try down first, then the four horizontal neighbours
+        var targets = [[x, y - 1, z], [x - 1, y, z], [x + 1, y, z], [x, y, z - 1], [x, y, z + 1]];
+        for (var i = 0; i < targets.length; i++) {
+          var nx = targets[i][0], ny = targets[i][1], nz = targets[i][2];
+          if (world.get(nx, ny, nz) !== BLK.AIR) continue;   // solids + fluids block
+          if (i > 0 && st.s <= 0) continue;                  // horizontal spread budget spent
+          world.set(nx, ny, nz, id);
+          meta[world._idx(nx, ny, nz)] = { t: (id === BLK.WATER) ? FLUID.WATER_INTERVAL : FLUID.LAVA_INTERVAL,
+                                           s: (i > 0) ? st.s - 1 : (id === BLK.WATER) ? FLUID.WATER_SPREAD : FLUID.LAVA_SPREAD };
+          updated++;
+          if (i > 0) st.s--;                                 // only horizontal steps cost budget
+          if (updated >= FLUID.TICK_CAP) return updated;
+          break;                                             // one spread step per fired timer
+        }
+        st.t = (id === BLK.WATER) ? FLUID.WATER_INTERVAL : FLUID.LAVA_INTERVAL;   // re-arm
+      }
+    }
+  }
+  return updated;
+}
+
 /* ---------------- M3/M4: item inventory + 2x2 crafting (PHASE-5) ----------------
    Items are block ids 1..9 plus inventory-only ITEM ids (10 crafting table,
    11 sticks, 12 apple/food) — outside the placeable BLK range so placeBlock
@@ -749,9 +846,11 @@ var API = {
   collides: collides, Player: Player, raycast: raycast,
   PLAYER: PLAYER, GRAVITY: GRAVITY, JUMP_V: JUMP_V, WALK: WALK, SPRINT: SPRINT,
   SNEAK: SNEAK, fallDamage: fallDamage,
+  HARDNESS: HARDNESS, HARVESTABLE: HARVESTABLE, breakTime: breakTime, BreakProgress: BreakProgress,
   ITEM: ITEM, Inventory: Inventory, RECIPES: RECIPES, craft: craft,
   FOOD_RESTORE: FOOD_RESTORE,
   MOB: MOB, Mob: Mob, skyExposed: skyExposed, spawnMobs: spawnMobs,
+  FLUID: FLUID, tickFluids: tickFluids,
   Sound: Sound
 };
 if (typeof module !== "undefined" && module.exports) { module.exports = API; }
@@ -1185,7 +1284,7 @@ g.ClonecraftCore = API;
   document.addEventListener("pointerlockchange", function () {
     locked = document.pointerLockElement === canvas;
     if (locked) { hud.classList.add("live"); intro.classList.add("hide"); }
-    else { hud.classList.remove("live"); }
+    else { hud.classList.remove("live"); releaseBreak(); }   // MC 1193.30: unlock cancels a held break
   });
   document.addEventListener("mousemove", function (e) {
     if (locked) {
@@ -1282,12 +1381,33 @@ g.ClonecraftCore = API;
     saveGame();                                            // T4-save: persist on change
   }
 
+  // PHASE-3 last bit (MC 1193.30): hold-to-break on the desktop left button.
+  // mousedown only ARMS the break (held-state + aimed block); update(dt) ticks
+  // a BreakProgress while the aim stays on the same block and calls
+  // breakBlockAt when done(). Aim change or button release resets progress.
+  // Mobile breakBtn keeps one-tap instant break (unchanged this round).
+  var held = false, heldBlock = null, breakProg = null;
+
+  function armBreak(hit) {
+    held = true;
+    heldBlock = [hit.block[0], hit.block[1], hit.block[2]];
+    breakProg = new C.BreakProgress(world.get(heldBlock[0], heldBlock[1], heldBlock[2]));
+  }
+
+  function releaseBreak() {
+    held = false; heldBlock = null;
+    if (breakProg) breakProg.reset();
+  }
+
   document.addEventListener("mousedown", function (e) {
     if (!locked) return;
     var hit = aimTarget();
     if (!hit) return;
-    if (e.button === 0) breakBlockAt(hit);
+    if (e.button === 0) armBreak(hit);
     else if (e.button === 2) placeBlock(hit.place[0], hit.place[1], hit.place[2]);
+  });
+  document.addEventListener("mouseup", function (e) {
+    if (e.button === 0) releaseBreak();
   });
   document.addEventListener("contextmenu", function (e) { e.preventDefault(); });
 
@@ -1457,6 +1577,27 @@ g.ClonecraftCore = API;
     // even when no block is placed/broken.
     lastSaveT += dt;
     if (lastSaveT >= 5) { lastSaveT = 0; saveGame(); }
+
+    // PHASE-3 last bit (MC 1193.30): hold-to-break — while the left button is
+    // held and the aim still hits the SAME block, tick the BreakProgress;
+    // when done() the block breaks and the hold clears. Aim moved to a
+    // different block -> reset progress and retarget; aim lost -> release.
+    if (held) {
+      var bhit = aimTarget();
+      if (bhit && bhit.block[0] === heldBlock[0] && bhit.block[1] === heldBlock[1] && bhit.block[2] === heldBlock[2]) {
+        breakProg.tick(dt);
+        if (breakProg.done()) { breakBlockAt(bhit); releaseBreak(); }
+      } else if (bhit) {
+        armBreak(bhit);
+      } else {
+        releaseBreak();
+      }
+    }
+
+    // PHASE-8 (M8/M9): fluid ticks live inside update() (invariant 4). One
+    // throttled cellular spread step per frame, capped at FLUID.TICK_CAP cell
+    // updates so the frame budget holds regardless of how much fluid exists.
+    C.tickFluids(world);
   }
 
   function render() {
